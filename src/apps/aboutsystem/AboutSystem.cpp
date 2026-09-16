@@ -1546,12 +1546,12 @@ AboutView::_CreateCreditsView()
 		fCreditsView, B_WILL_DRAW | B_FRAME_EVENTS, false, true,
 		B_PLAIN_BORDER);
 
-	// Haiku copyright
+	// RenkuOS copyright
 	BFont font(be_bold_font);
 	font.SetSize(font.Size() + 4);
 
 	fCreditsView->SetFontAndColor(&font, B_FONT_ALL, &fHaikuGreenColor);
-	fCreditsView->Insert("Haiku\n");
+	fCreditsView->Insert("RenkuOS\n");
 
 	time_t time = ::time(NULL);
 	struct tm* tm = localtime(&time);
@@ -1559,6 +1559,19 @@ AboutView::_CreateCreditsView()
 	if (year < 2008)
 		year = 2008;
 	BString text;
+	text.SetToFormat(
+		B_TRANSLATE(COPYRIGHT_STRING "2001-%" B_PRId32 " The RenkuOS authors. "),
+		year);
+
+	fCreditsView->SetFontAndColor(be_plain_font, B_FONT_ALL, &fTextColor);
+	fCreditsView->Insert(text.String());
+
+	fCreditsView->SetFontAndColor(be_plain_font, B_FONT_ALL, &fTextColor);
+	fCreditsView->Insert(B_TRANSLATE("RenkuOS is an operating system based on "
+		"Haiku, but is not an official Haiku distribution and is not endorsed "
+		"by Haiku, Inc."
+		"\n\n"));
+
 	text.SetToFormat(
 		B_TRANSLATE(COPYRIGHT_STRING "2001-%" B_PRId32 " The Haiku project. "),
 		year);
@@ -1575,18 +1588,24 @@ AboutView::_CreateCreditsView()
 		"\n\n"));
 
 	fCreditsView->SetFontAndColor(be_plain_font, B_FONT_ALL, &fLinkColor);
-	fCreditsView->InsertHyperText(B_TRANSLATE("Visit the Haiku website"),
-		new URLAction("https://www.haiku-os.org"));
+	fCreditsView->InsertHyperText(B_TRANSLATE("Visit the RenkuOS website"),
+		new URLAction("https://github.com/RenkuOS/"));
 	fCreditsView->Insert("\n");
-	fCreditsView->InsertHyperText(B_TRANSLATE("Make a donation"),
-		new URLAction("https://www.haiku-inc.org/donate"));
+	fCreditsView->InsertHyperText(B_TRANSLATE("Based on Haiku"),
+		new URLAction("https://www.haiku-os.org/"));
 	fCreditsView->Insert("\n\n");
 
 	font.SetSize(be_bold_font->Size());
 	font.SetFace(B_BOLD_FACE | B_ITALIC_FACE);
 
 	fCreditsView->SetFontAndColor(&font, B_FONT_ALL, &fHaikuOrangeColor);
-	fCreditsView->Insert(B_TRANSLATE("Current maintainers:\n"));
+	fCreditsView->Insert(B_TRANSLATE("RenkuOS current maintainers:\n"));
+
+	fCreditsView->SetFontAndColor(be_plain_font, B_FONT_ALL, &fTextColor);
+	fCreditsView->Insert(kRenkuOSCurrentMaintainers);
+
+	fCreditsView->SetFontAndColor(&font, B_FONT_ALL, &fHaikuOrangeColor);
+	fCreditsView->Insert(B_TRANSLATE("Haiku maintainers:\n"));
 
 	fCreditsView->SetFontAndColor(be_plain_font, B_FONT_ALL, &fTextColor);
 	fCreditsView->Insert(kCurrentMaintainers);
