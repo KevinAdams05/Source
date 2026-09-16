@@ -515,6 +515,10 @@ static const Translation kTranslations[] = {
 
 #define kNumberOfTranslations (sizeof(kTranslations) / sizeof(Translation))
 
+#define kRenkuOSCurrentMaintainers \
+	"Hello World\n" \
+	"\n"
+
 #define kCurrentMaintainers \
 	"Pascal R. G. Abresch\n" \
 	"Máximo Castañeda\n" \
