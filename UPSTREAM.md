@@ -20,9 +20,7 @@ upstream honest and the fix attributable.
 
 | Date | Upstream commit | Subject | Why |
 |---|---|---|---|
-
-Nothing yet. The tree starts from upstream hrev60072, so there is nothing sitting on top of
-it to record.
+| 2026-09-16 | `fcdee3a787` | deskbar: don't loop forever if replicant is larger than the row itself | Fixes a Deskbar hang (#19394): a replicant wider than the tray made the placement loop spin at 100% CPU, so Deskbar never appeared |
 
 ## Declined
 
