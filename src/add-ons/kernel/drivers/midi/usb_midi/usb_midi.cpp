@@ -134,6 +134,7 @@ create_device(const usb_device* dev, uint16 ifno)
 	midiDevice->active = true;
 	midiDevice->flags = 0;
 	midiDevice->in_is_interrupt = false;
+	midiDevice->consecutive_errors = 0;
 	memset(midiDevice->ports, 0, sizeof(midiDevice->ports));
 	midiDevice->inMaxPkt = midiDevice->outMaxPkt = B_PAGE_SIZE / 2;
 		/* Initially -- will get reduced */
@@ -229,6 +230,14 @@ interpret_midi_buffer(usbmidi_device_info* midiDevice)
 }
 
 
+/* Stop re-queuing the IN transfer after this many consecutive failures (reset
+   by any good transfer). A flaky / half-disconnected device can fail every
+   transfer without ever returning B_CANCELED; without this cap the callback
+   re-queues in a tight loop, flooding the host controller with errored TDs and
+   wedging the whole system. Transient glitches are absorbed by the reset. */
+#define MAX_CONSECUTIVE_READ_ERRORS	100
+
+
 /*
 	callback: got a report, issue next request
 */
@@ -269,13 +278,27 @@ midi_usb_read_callback(void* cookie, status_t status,
 			release_sem(midiDevice->sem_lock);
 			return;
 		}
+		/* Still-present device returning errors (e.g. a dirty disconnect that
+		   never cancels). Count it so we can give up before flooding the bus. */
+		midiDevice->consecutive_errors++;
 		release_sem(midiDevice->sem_lock);
 	} else {
 		/* got a report */
 		midiDevice->timestamp = system_time();	/* not used... */
+		midiDevice->consecutive_errors = 0;
 
 		interpret_midi_buffer(midiDevice);
 		release_sem(midiDevice->sem_lock);
+	}
+
+	if (midiDevice->consecutive_errors >= MAX_CONSECUTIVE_READ_ERRORS) {
+		DPRINTF_ERR((MY_ID "%s: %d consecutive IN-transfer errors -- stopping "
+			"input (device likely unplugged or faulty)\n",
+			midiDevice->name, midiDevice->consecutive_errors));
+		/* Do not re-queue. usb_midi_removed() does the real teardown when the
+		   unplug completes; a recovered device re-enumerates and starts a fresh
+		   transfer loop. */
+		return;
 	}
 
 	/* issue next request */

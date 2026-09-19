@@ -103,6 +103,10 @@ typedef struct usbmidi_device_info
 	bool in_is_interrupt;
 		/* IN endpoint is an interrupt endpoint (use queue_interrupt), as on
 		   some Roland devices, rather than bulk */
+	int consecutive_errors;	/* failed IN transfers since the last good one;
+							   bounds the read-callback re-queue loop so a flaky
+							   device (dirty unplug) cannot flood the host
+							   controller and wedge the system */
 } usbmidi_device_info;
 
 
