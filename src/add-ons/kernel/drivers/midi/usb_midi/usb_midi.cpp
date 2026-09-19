@@ -577,10 +577,19 @@ usb_midi_read(driver_cookie* cookie, off_t position,
 	while (midiDevice && midiDevice->active) {
 		ZDPRINTF_DEBUG((MY_ID "waiting on acquire_sem_etc\n"));
 		err = acquire_sem_etc(cookie->sem_cb, 1,
-			 B_RELATIVE_TIMEOUT, 1000000);
+			B_RELATIVE_TIMEOUT | B_CAN_INTERRUPT, 1000000);
 		if (err == B_TIMED_OUT) {
 			ZDPRINTF_DEBUG((MY_ID "acquire_sem_etc timed out\n"));
 			continue;	/* see if we're still active */
+		}
+		if (err == B_INTERRUPTED) {
+			/* A signal arrived while no MIDI data was pending. Without
+			   B_CAN_INTERRUPT a reader on an idle device could not be
+			   stopped at all, not even by SIGKILL, until data arrived or
+			   the device was unplugged. Not B_CANCELED: the device is
+			   still here. */
+			*num_bytes = 0;
+			return B_INTERRUPTED;
 		}
 		if (err != B_OK) {
 			*num_bytes = 0;
