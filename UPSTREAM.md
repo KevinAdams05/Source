@@ -21,6 +21,7 @@ upstream honest and the fix attributable.
 | Date | Upstream commit | Subject | Why |
 |---|---|---|---|
 | 2026-09-16 | `fcdee3a787` | deskbar: don't loop forever if replicant is larger than the row itself | Fixes a Deskbar hang (#19394): a replicant wider than the tray made the placement loop spin at 100% CPU, so Deskbar never appeared |
+| 2026-09-19 | `e9ade57f61` | ntfs: fix vnode leak on mkdir | Creating one directory on an NTFS volume leaked a vnode reference, so the volume could never be unmounted again ("inode is still referenced") |
 
 ## Declined
 
