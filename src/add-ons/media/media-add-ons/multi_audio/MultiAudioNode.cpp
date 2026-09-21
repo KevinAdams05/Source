@@ -34,6 +34,10 @@
 #define PARAMETER_ID_INPUT_FREQUENCY	1
 #define PARAMETER_ID_OUTPUT_FREQUENCY	2
 
+// Depth of the per-input buffer queue (see node_input). Sized to absorb the
+// burstiest arrival cadence observed (~3 buffers at once) with one to spare.
+static const int32 kInputQueueDepth = 4;
+
 
 // This represents a hardware output.
 class node_input {
@@ -48,7 +52,19 @@ public:
 
 	volatile uint32		fBufferCycle;
 	int32				fOldBufferCycle;
-	BBuffer*			fBuffer;
+	// Buffer queue between the (asynchronous) arrival path and the
+	// (hardware-paced) exchange beat. A single slot forces a phase race:
+	// producers that deliver buffers in bursts (~3 buffers after ~30 ms gaps)
+	// or right on the beat boundary lose one arrival and zero-fill one beat
+	// per overflow/underflow pair, a stable cycle that silences up to ~25% of
+	// all buffers. A queue deep enough to absorb the bursts plays any arrival
+	// cadence with the correct average rate cleanly, at the price of up to
+	// kInputQueueDepth buffer periods of latency.
+	// Single producer (arrival path writes fQueueTail), single consumer (the
+	// exchange beat writes fQueueHead); atomic_set/get order the accesses.
+	BBuffer*			fQueue[kInputQueueDepth];
+	int32				fQueueHead;
+	int32				fQueueTail;
 	Resampler			*fResampler;
 };
 
@@ -132,7 +148,10 @@ node_input::node_input(media_input& input, media_format preferredFormat)
 	fPreferredFormat = preferredFormat;
 	fBufferCycle = 1;
 	fOldBufferCycle = -1;
-	fBuffer = NULL;
+	for (int32 i = 0; i < kInputQueueDepth; i++)
+		fQueue[i] = NULL;
+	fQueueHead = 0;
+	fQueueTail = 0;
 	fResampler = NULL;
 }
 
@@ -1181,22 +1200,27 @@ MultiAudioNode::_HandleBuffer(const media_timed_event* event,
 		fprintf(stderr,"	<- LATE BUFFER: %" B_PRIdBIGTIME "\n", lateness);
 		buffer->Recycle();
 	} else {
-		//WriteBuffer(buffer, *channel);
-		// TODO: This seems like a very fragile mechanism to wait until
-		// the previous buffer for this channel has been processed...
-		if (channel->fBuffer != NULL) {
-			PRINT(("MultiAudioNode::HandleBuffer snoozing recycling channelId: "
-				"%" B_PRIi32 ", lateness:%" B_PRIdBIGTIME "\n",
-				channel->fChannelId, lateness));
-			//channel->fBuffer->Recycle();
-			snooze(100);
-			if (channel->fBuffer != NULL)
-				buffer->Recycle();
-			else
-				channel->fBuffer = buffer;
+		// Enqueue (see node_input): store the buffer first, then publish it
+		// by advancing the tail, so the consumer never sees an unwritten
+		// slot.
+		int32 tail = atomic_get(&channel->fQueueTail);
+		if (tail - atomic_get(&channel->fQueueHead) < kInputQueueDepth) {
+			channel->fQueue[tail % kInputQueueDepth] = buffer;
+			atomic_set(&channel->fQueueTail, tail + 1);
 		} else {
-			//PRINT(("MultiAudioNode::HandleBuffer writing channelId: %li, how_early:%lld\n", channel->fChannelId, howEarly));
-			channel->fBuffer = buffer;
+			// Queue full: the producer ran a whole queue depth ahead of the
+			// hardware. Give the beat one chance to drain, else shed the
+			// incoming buffer to keep latency bounded.
+			PRINT(("MultiAudioNode::HandleBuffer queue full, dropping,"
+				" channelId: %" B_PRIi32 ", lateness:%" B_PRIdBIGTIME "\n",
+				channel->fChannelId, lateness));
+			snooze(100);
+			tail = atomic_get(&channel->fQueueTail);
+			if (tail - atomic_get(&channel->fQueueHead) < kInputQueueDepth) {
+				channel->fQueue[tail % kInputQueueDepth] = buffer;
+				atomic_set(&channel->fQueueTail, tail + 1);
+			} else
+				buffer->Recycle();
 		}
 	}
 	return B_OK;
@@ -1813,10 +1837,18 @@ MultiAudioNode::_OutputThread()
 
 				input->fOldBufferCycle = bufferInfo.playback_buffer_cycle;
 
-				if (input->fBuffer != NULL) {
-					_FillNextBuffer(*input, input->fBuffer);
-					input->fBuffer->Recycle();
-					input->fBuffer = NULL;
+				// Dequeue the oldest queued buffer, if any (see node_input).
+				// The slot is read before the head is advanced, so the
+				// arrival path cannot overwrite it in between.
+				BBuffer* queued = NULL;
+				int32 queueHead = atomic_get(&input->fQueueHead);
+				if (atomic_get(&input->fQueueTail) - queueHead > 0)
+					queued = input->fQueue[queueHead % kInputQueueDepth];
+
+				if (queued != NULL) {
+					_FillNextBuffer(*input, queued);
+					queued->Recycle();
+					atomic_set(&input->fQueueHead, queueHead + 1);
 				} else {
 					// put zeros in current buffer
 					if (input->fInput.source != media_source::null)
@@ -2057,10 +2089,19 @@ MultiAudioNode::_StopOutputThread()
 
 	for (int32 i = 0; i < fInputs.CountItems(); i++) {
 		node_input* input = (node_input*)fInputs.ItemAt(i);
-		if (input->fBuffer != NULL) {
-			input->fBuffer->Recycle();
-			input->fBuffer = NULL;
+		// Recycle every buffer still queued, or a stop leaks whatever the
+		// arrival path queued after the last exchange beat.
+		int32 queueHead = atomic_get(&input->fQueueHead);
+		int32 queueTail = atomic_get(&input->fQueueTail);
+		while (queueTail - queueHead > 0) {
+			BBuffer* queued = input->fQueue[queueHead % kInputQueueDepth];
+			if (queued != NULL)
+				queued->Recycle();
+			queueHead++;
 		}
+		atomic_set(&input->fQueueHead, queueHead);
+		atomic_set(&input->fQueueTail, queueHead);
+
 		if (fDevice->BufferList().playback_buffers[0][input->fChannelId].base != NULL)
 			_FillWithZeros(*input);
 	}
