@@ -94,7 +94,17 @@ MultiAudioAddOn::GetFlavorAt(int32 index, const flavor_info** _info)
 		return B_NO_MEMORY;
 
 	MultiAudioNode::GetFlavor(info, index);
-	info->name = device->Description().friendly_name;
+
+	const multi_description& description = device->Description();
+	info->name = description.friendly_name;
+
+	// GetFlavor() claims both kinds for every device. Advertise only what the
+	// hardware really has, or an output-only card turns up in Media
+	// preferences as a recording source that can never produce a frame.
+	if (description.input_channel_count <= 0)
+		info->kinds &= ~(uint64)B_PHYSICAL_INPUT;
+	if (description.output_channel_count <= 0)
+		info->kinds &= ~(uint64)B_PHYSICAL_OUTPUT;
 
 	*_info = info;
 	return B_OK;
