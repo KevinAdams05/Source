@@ -100,6 +100,9 @@ typedef struct usbmidi_device_info
 
 	bigtime_t timestamp;	/* Is this needed? Currently set but never read */
 	uint flags;				/* set to 0 but never used */
+	bool in_is_interrupt;
+		/* IN endpoint is an interrupt endpoint (use queue_interrupt), as on
+		   some Roland devices, rather than bulk */
 } usbmidi_device_info;
 
 

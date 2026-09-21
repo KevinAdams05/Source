@@ -133,6 +133,7 @@ create_device(const usb_device* dev, uint16 ifno)
 	midiDevice->ifno = ifno;
 	midiDevice->active = true;
 	midiDevice->flags = 0;
+	midiDevice->in_is_interrupt = false;
 	memset(midiDevice->ports, 0, sizeof(midiDevice->ports));
 	midiDevice->inMaxPkt = midiDevice->outMaxPkt = B_PAGE_SIZE / 2;
 		/* Initially -- will get reduced */
@@ -278,9 +279,14 @@ midi_usb_read_callback(void* cookie, status_t status,
 	}
 
 	/* issue next request */
-	st = usb->queue_bulk(midiDevice->ept_in->handle,
-		midiDevice->buffer, midiDevice->inMaxPkt,
-		(usb_callback_func)midi_usb_read_callback, midiDevice);
+	if (midiDevice->in_is_interrupt)
+		st = usb->queue_interrupt(midiDevice->ept_in->handle,
+			midiDevice->buffer, midiDevice->inMaxPkt,
+			(usb_callback_func)midi_usb_read_callback, midiDevice);
+	else
+		st = usb->queue_bulk(midiDevice->ept_in->handle,
+			midiDevice->buffer, midiDevice->inMaxPkt,
+			(usb_callback_func)midi_usb_read_callback, midiDevice);
 	if (st != B_OK) {
 		/* probably endpoint stall */
 		DPRINTF_ERR((MY_ID "queue_bulk() error 0x%" B_PRIx32 "\n", st));
@@ -306,6 +312,116 @@ midi_usb_write_callback(void* cookie, status_t status,
 
 
 /*
+	Roland/Edirol "Advanced mode" MIDI quirk table
+
+	These devices present a vendor-specific interface that carries no standard
+	USB-MIDI class descriptors, so the MIDI interface and its cable layout cannot
+	be discovered by parsing -- they are properties of the hardware and must be
+	known per model. The values below were taken from each device's published USB
+	descriptors and cross-checked against Linux ALSA's device tables; only the
+	factual ids/interface numbers/cable layouts are used, none of ALSA's code.
+
+	In "Standard/Generic mode" these same units enumerate as class-compliant
+	USB-MIDI (a different product id) and are handled by the generic descriptor
+	path in usb_midi_added(), so they need no entry here.
+
+	  in_mask / out_mask  bitmask of active USB-MIDI cable numbers (bit c set =>
+	                      cable c present). May be sparse or asymmetric.
+	  midi_interface      the MIDI interface number, or -1 to locate it by its
+	                      bulk endpoint pair (the UA-xx audio composites, whose
+	                      MIDI interface is not at a fixed number/altsetting).
+*/
+struct roland_midi_quirk {
+	uint16	product_id;
+	int		midi_interface;
+	uint16	in_mask;
+	uint16	out_mask;
+};
+
+static const roland_midi_quirk kRolandMidiQuirks[] = {
+	/* product, iface, in_mask, out_mask		device (in x out cables) */
+	{ 0x0000,  2, 0x0007, 0x0007 },		/* UA-100 (3x3) */
+	{ 0x0002,  2, 0x000f, 0x000f },		/* UM-4 (4x4) */
+	{ 0x0003,  2, 0x003f, 0x003f },		/* SC-8850 (6x6) */
+	{ 0x0004,  2, 0x0005, 0x0005 },		/* U-8 (cables 0,2) */
+	{ 0x0005,  2, 0x0003, 0x0003 },		/* UM-2 (2x2) */
+	{ 0x0007,  2, 0x0013, 0x0013 },		/* SC-8820 (cables 0,1,4) */
+	{ 0x0008,  2, 0x0001, 0x0001 },		/* PC-300 (1x1) */
+	{ 0x0009,  2, 0x0001, 0x0001 },		/* UM-1 (1x1) */
+	{ 0x000b,  2, 0x0013, 0x0013 },		/* SK-500 (cables 0,1,4) */
+	{ 0x000c,  2, 0x0007, 0x0007 },		/* SC-D70 (3x3) */
+	{ 0x0012,  0, 0x0001, 0x0001 },		/* XV-5050 (1x1) */
+	{ 0x0014,  0, 0x01ff, 0x01ff },		/* UM-880 (9x9) */
+	{ 0x0016,  2, 0x000f, 0x000f },		/* SD-90 (4x4) */
+	{ 0x001b,  2, 0x0001, 0x0001 },		/* MMP-2 (1x1) */
+	{ 0x001d,  0, 0x0001, 0x0001 },		/* V-SYNTH (1x1) */
+	{ 0x0023,  0, 0x003f, 0x003f },		/* UM-550 (6x6) */
+	{ 0x0025,  3, 0x0001, 0x0001 },		/* UA-20 (1x1) */
+	{ 0x0027,  0, 0x0007, 0x0003 },		/* SD-20 (3 in, 2 out) */
+	{ 0x0029,  0, 0x000f, 0x000f },		/* SD-80 (4x4) */
+	{ 0x002b, -1, 0x0003, 0x0003 },		/* UA-700 (2x2, UA-xx composite) */
+	{ 0x002d,  0, 0x0001, 0x0001 },		/* XV-2020 (1x1) */
+	{ 0x002f,  0, 0x0007, 0x0007 },		/* VariOS (3x3) */
+	{ 0x0033,  0, 0x0007, 0x0003 },		/* PCR (3 in, 2 out) */
+	{ 0x0037,  0, 0x0001, 0x0001 },		/* Digital Piano (1x1) */
+	{ 0x0040,  0, 0x0001, 0x0001 },		/* GI-20 (1x1) */
+	{ 0x0042,  0, 0x0001, 0x0001 },		/* RS-70 (1x1) */
+	{ 0x0048,  0, 0x0007, 0x0003 },		/* UR-80 (3 in, 2 out) */
+	{ 0x004d,  0, 0x0007, 0x0003 },		/* PCR-A (3 in, 2 out) */
+	{ 0x0065,  0, 0x0003, 0x0001 },		/* PCR-1 (2 in, 1 out) */
+	{ 0x006d,  0, 0x0001, 0x0001 },		/* FANTOM-X (1x1) */
+	{ 0x0074, -1, 0x0001, 0x0001 },		/* UA-25 (1x1, UA-xx composite) */
+	{ 0x0075,  0, 0x0001, 0x0001 },		/* DR-880 (1x1) */
+	{ 0x007a,  0, 0x0003, 0x0003 },		/* RD-700SX (2x2) */
+	{ 0x0080,  0, 0x0001, 0x0001 },		/* G-70 (1x1) */
+	{ 0x008b,  0, 0x0001, 0x0001 },		/* PC-50 (1x1) */
+	{ 0x00a3, -1, 0x0001, 0x0001 },		/* UA-4FX (1x1, UA-xx composite) */
+	{ 0x00c4,  2, 0x0001, 0x0001 },		/* M-16DX (1x1) */
+	{ 0x00e6, -1, 0x0001, 0x0001 },		/* UA-25EX (1x1, UA-xx composite) */
+	{ 0x0108,  0, 0x0007, 0x0007 },		/* UM-3G (3x3) */
+	{ 0x0113,  2, 0x0001, 0x0001 },		/* BOSS ME-25 (1x1) */
+	{ 0x0120,  2, 0x0001, 0x0001 },		/* OCTO-CAPTURE (1x1) */
+	{ 0x012f,  2, 0x0001, 0x0001 },		/* QUAD-CAPTURE (1x1) */
+	{ 0x0159,  2, 0x0001, 0x0001 },		/* UA-22 (1x1) */
+};
+
+
+static const roland_midi_quirk*
+find_roland_quirk(uint16 vendor, uint16 product)
+{
+	if (vendor != 0x0582)
+		return NULL;
+	const int count = sizeof(kRolandMidiQuirks) / sizeof(kRolandMidiQuirks[0]);
+	for (int i = 0; i < count; i++) {
+		if (kRolandMidiQuirks[i].product_id == product)
+			return &kRolandMidiQuirks[i];
+	}
+	return NULL;
+}
+
+
+/* True if this interface alternate exposes a usable MIDI endpoint pair (one IN
+   and one OUT, bulk or interrupt). Isochronous endpoints are skipped so the
+   audio interfaces of composite Roland units are not mistaken for the MIDI one. */
+static bool
+interface_has_midi_io(const usb_interface_info* intf)
+{
+	bool hasIn = false;
+	bool hasOut = false;
+	for (uint16 i = 0; i < intf->endpoint_count; i++) {
+		usb_endpoint_descriptor* ed = intf->endpoint[i].descr;
+		if ((ed->attributes & 0x03) == 0x01)
+			continue;	/* isochronous (audio) */
+		if ((ed->endpoint_address & 0x80) != 0)
+			hasIn = true;
+		else
+			hasOut = true;
+	}
+	return hasIn && hasOut;
+}
+
+
+/*
 	USB specific device hooks
 */
 
@@ -326,6 +442,12 @@ usb_midi_added(const usb_device* dev, void** cookie)
 
 	DPRINTF_INFO((MY_ID "vendor ID 0x%04X, product ID 0x%04X\n",
 		dev_desc->vendor_id, dev_desc->product_id));
+
+	/* Roland/Edirol "Advanced mode" MIDI interfaces are looked up in a per-model
+	   table (kRolandMidiQuirks): they carry no standard USB-MIDI descriptors, so
+	   the MIDI interface and its cable layout must be known in advance. */
+	const roland_midi_quirk* roland =
+		find_roland_quirk(dev_desc->vendor_id, dev_desc->product_id);
 
 	/* check interface class */
 	const usb_configuration_info* conf;
@@ -350,6 +472,17 @@ usb_midi_added(const usb_device* dev, void** cookie)
 				MY_ID "interface %d, alt : %d: class %d,"
 				" subclass %d, protocol %d\n",
                 ifno, alt, devclass, subclass, protocol));
+
+			/* Roland "Advanced mode" devices (kRolandMidiQuirks) carry no
+			   standard descriptors. Accept their MIDI interface: the model's
+			   designated interface number when known, otherwise the interface
+			   located by its MIDI endpoint pair. The endpoint check also rejects
+			   the isochronous audio interfaces of composite UA-xx units. */
+			if (roland != NULL
+				&& (roland->midi_interface < 0
+					|| (int)ifno == roland->midi_interface)
+				&& interface_has_midi_io(intf))
+				goto got_one;
 
 			if (devclass == USB_AUDIO_DEVICE_CLASS
 				&& subclass == USB_AUDIO_INTERFACE_MIDISTREAMING_SUBCLASS)
@@ -409,27 +542,30 @@ got_one:
 		midiDevice, intf->endpoint_count));
 	midiDevice->ept_in = midiDevice->ept_out = NULL;
 
-	for (uint16 i = 0; i < intf->endpoint_count && i < 2; i++) {
-		/* we are actually assuming max one IN, one OUT endpoint... */
-		DPRINTF_INFO((MY_ID "endpoint %d = %p  %s maxPkt=%d\n",
-			i, &intf->endpoint[i],
-			(intf->endpoint[i].descr->endpoint_address & 0x80) != 0
-			 ? "IN" : "OUT", intf->endpoint[i].descr->max_packet_size));
-		if ((intf->endpoint[i].descr->endpoint_address & 0x80) != 0) {
+	/* Pick the first IN and first OUT endpoint. Scan them all rather than only
+	   the first two, and note whether the IN endpoint is an interrupt endpoint,
+	   as it is on some Roland devices. */
+	for (uint16 i = 0; i < intf->endpoint_count; i++) {
+		usb_endpoint_descriptor* ed = intf->endpoint[i].descr;
+		bool isIn = (ed->endpoint_address & 0x80) != 0;
+		bool isInterrupt = (ed->attributes & 0x03) == 0x03;
+		DPRINTF_INFO((MY_ID "endpoint %d = %p  %s %s maxPkt=%d\n",
+			i, &intf->endpoint[i], isIn ? "IN" : "OUT",
+			isInterrupt ? "interrupt" : "bulk", ed->max_packet_size));
+		if (isIn) {
 			if (midiDevice->ept_in == NULL) {
 				midiDevice->ept_in = &intf->endpoint[i];
-				in_cables = cable_count[i];
-				if (intf->endpoint[i].descr->max_packet_size
-					< midiDevice->inMaxPkt)
-					midiDevice->inMaxPkt = intf->endpoint[i].descr->max_packet_size;
+				midiDevice->in_is_interrupt = isInterrupt;
+				in_cables = (i < 2) ? cable_count[i] : 0;
+				if (ed->max_packet_size < midiDevice->inMaxPkt)
+					midiDevice->inMaxPkt = ed->max_packet_size;
 			}
 		} else {
 			if (midiDevice->ept_out == NULL) {
 				midiDevice->ept_out = &intf->endpoint[i];
-				out_cables = cable_count[i];
-				if (intf->endpoint[i].descr->max_packet_size
-					< midiDevice->outMaxPkt)
-					midiDevice->outMaxPkt = intf->endpoint[i].descr->max_packet_size;
+				out_cables = (i < 2) ? cable_count[i] : 0;
+				if (ed->max_packet_size < midiDevice->outMaxPkt)
+					midiDevice->outMaxPkt = ed->max_packet_size;
 			}
 		}
 	}
@@ -439,7 +575,12 @@ got_one:
 	   the CS_INTERFACE MIDI jack descriptors: each MIDI IN jack is an input
 	   cable, each MIDI OUT jack an output cable. Count all jacks regardless of
 	   EMBEDDED/EXTERNAL type -- Yamaha marks them all EXTERNAL. */
-	if (in_cables == 0 && out_cables == 0) {
+	if (roland != NULL) {
+		/* Cables come from the per-model bitmasks, applied at port-creation
+		   time below; there is nothing to count from descriptors here. */
+		DPRINTF_INFO((MY_ID "roland cables: in_mask=0x%x out_mask=0x%x\n",
+			(unsigned int)roland->in_mask, (unsigned int)roland->out_mask));
+	} else if (in_cables == 0 && out_cables == 0) {
 		for (uint16 i = 0; i < intf->generic_count; i++) {
 			usb_generic_descriptor* gd = &intf->generic[i]->generic;
 			if (gd->descriptor_type != USB_DESCRIPTOR_CS_INTERFACE)
@@ -461,23 +602,45 @@ got_one:
 
 	/* Create the actual device ports */
 	usbmidi_port_info* port;
-	for (uint16 i = 0; in_cables > 0 || out_cables > 0; i++) {
-		port = create_usbmidi_port(midiDevice, i,
-			(bool)in_cables, (bool)out_cables);
-		midiDevice->ports[i] = port;
-		if (in_cables)
-			in_cables--;
-		if (out_cables)
-			out_cables--;
-		add_port_info(port);
+	if (roland != NULL) {
+		/* The cable set is given by per-model bitmasks of USB-MIDI cable
+		   numbers, which may be sparse or asymmetric between in and out. Create
+		   a port at each cable number present in either direction; ports are
+		   indexed by cable number, so an incoming/outgoing 'cn' nibble maps
+		   straight to its port (create_usbmidi_port() stores it in
+		   midiDevice->ports[cable]). */
+		for (uint16 c = 0; c < 16; c++) {
+			bool cin = (roland->in_mask & (1 << c)) != 0;
+			bool cout = (roland->out_mask & (1 << c)) != 0;
+			if (!cin && !cout)
+				continue;
+			port = create_usbmidi_port(midiDevice, c, cin, cout);
+			add_port_info(port);
+		}
+	} else {
+		for (uint16 i = 0; in_cables > 0 || out_cables > 0; i++) {
+			port = create_usbmidi_port(midiDevice, i,
+				(bool)in_cables, (bool)out_cables);
+			midiDevice->ports[i] = port;
+			if (in_cables)
+				in_cables--;
+			if (out_cables)
+				out_cables--;
+			add_port_info(port);
+		}
 	}
 
 	/* issue bulk transfer */
 	if (midiDevice->ept_in != NULL) {
 		DPRINTF_DEBUG((MY_ID "queueing bulk xfer IN endpoint\n"));
-		status = usb->queue_bulk(midiDevice->ept_in->handle, midiDevice->buffer,
-			midiDevice->inMaxPkt,
-			(usb_callback_func)midi_usb_read_callback, midiDevice);
+		if (midiDevice->in_is_interrupt)
+			status = usb->queue_interrupt(midiDevice->ept_in->handle,
+				midiDevice->buffer, midiDevice->inMaxPkt,
+				(usb_callback_func)midi_usb_read_callback, midiDevice);
+		else
+			status = usb->queue_bulk(midiDevice->ept_in->handle,
+				midiDevice->buffer, midiDevice->inMaxPkt,
+				(usb_callback_func)midi_usb_read_callback, midiDevice);
 		if (status != B_OK) {
 			DPRINTF_ERR((MY_ID "queue_bulk() error 0x%" B_PRIx32 "\n", status));
 			return B_ERROR;
@@ -532,7 +695,7 @@ static usb_notify_hooks my_notify_hooks =
 	usb_midi_added, usb_midi_removed
 };
 
-#define	SUPPORTED_DEVICES	2
+#define	SUPPORTED_DEVICES	3
 usb_support_descriptor my_supported_devices[SUPPORTED_DEVICES] =
 {
 	{	/* class-compliant USB-MIDI, any vendor */
@@ -546,6 +709,13 @@ usb_support_descriptor my_supported_devices[SUPPORTED_DEVICES] =
 		   gates on the actual presence of USB-MIDI descriptors, so non-MIDI
 		   Yamaha devices (e.g. pure-audio interfaces) are rejected there. */
 		0, 0, 0, 0x0499, 0
+	},
+	{	/* Roland / Edirol (vendor 0x0582). Matched broadly by vendor;
+		   usb_midi_added() then accepts either an "Advanced mode" device listed
+		   in kRolandMidiQuirks (no standard descriptors) or a class-compliant /
+		   Standard-mode device carrying USB-MIDI descriptors, and rejects the
+		   rest (e.g. pure-audio interfaces). */
+		0, 0, 0, 0x0582, 0
 	},
 };
 
