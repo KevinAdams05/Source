@@ -2123,8 +2123,16 @@ MultiAudioNode::_UpdateTimeSource(multi_buffer_info& info, node_input& input)
 
 	fTimeComputer.AddTimeStamp(info.played_real_time,
 		info.played_frames_count);
+
+	// Publish a drift of exactly 1.0. The pairs above re-anchor the mapping
+	// every buffer period, so ignoring the clock's real drift costs about a
+	// microsecond of extrapolation error. More importantly,
+	// BTimeSource::RealTimeFor() and PerformanceTimeFor() only take their
+	// large-difference path when drift is exactly 1.0; with any other value,
+	// a consumer asking about a time more than ~16.8 s from our last pair
+	// hits debugger() in its own team -- often media_addon_server.
 	PublishTime(fTimeComputer.PerformanceTime(), fTimeComputer.RealTime(),
-		fTimeComputer.Drift());
+		1.0f);
 }
 
 
