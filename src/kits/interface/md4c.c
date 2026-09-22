@@ -94,9 +94,19 @@
 
     #define MD_UNREACHABLE()        MD_ASSERT(1 == 0)
 #else
-    #ifdef __GNUC__
+    #if defined __GNUC__  &&  (__GNUC__ > 4  ||  (__GNUC__ == 4  &&  __GNUC_MINOR__ >= 5))
         #define MD_ASSERT(cond)     do { if(!(cond)) __builtin_unreachable(); } while(0)
         #define MD_UNREACHABLE()    do { __builtin_unreachable(); } while(0)
+    #elif defined __GNUC__
+        /* __builtin_unreachable() only exists from GCC 4.5 on; Haiku's
+         * x86_gcc2 compiler is 2.95. Leaving MD_UNREACHABLE() empty there
+         * makes the compiler warn that control reaches the end of a
+         * non-void function (md_opener_stack()) and that a variable may be
+         * used uninitialized (md_emph_stack()), which -Werror turns into
+         * build failures. abort() is noreturn, which is exactly what those
+         * switch defaults need to express. */
+        #define MD_ASSERT(cond)     do {} while(0)
+        #define MD_UNREACHABLE()    do { abort(); } while(0)
     #elif defined _MSC_VER  &&  _MSC_VER > 120
         #define MD_ASSERT(cond)     do { __assume(cond); } while(0)
         #define MD_UNREACHABLE()    do { __assume(0); } while(0)
@@ -1699,7 +1709,15 @@ typedef struct MD_REF_DEF_LIST_tag MD_REF_DEF_LIST;
 struct MD_REF_DEF_LIST_tag {
     int n_ref_defs;
     int alloc_ref_defs;
+#if defined __GNUC__  &&  __GNUC__ < 3
+    /* GCC 2.95 predates C99 flexible array members and rejects this field
+     * as having an incomplete type. Its zero-length array extension has the
+     * same layout and leaves sizeof(MD_REF_DEF_LIST) unchanged, so the
+     * malloc()/realloc() size arithmetic below stays correct. */
+    MD_REF_DEF* ref_defs[0]; /* Valid items always  point into ctx->ref_defs[] */
+#else
     MD_REF_DEF* ref_defs[];  /* Valid items always  point into ctx->ref_defs[] */
+#endif
 };
 
 static int
