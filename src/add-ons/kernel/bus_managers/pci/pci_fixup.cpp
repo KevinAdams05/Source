@@ -155,6 +155,114 @@ intel_fixup_ahci(PCI *pci, uint8 domain, uint8 bus, uint8 device,
 }
 
 
+// The Poulsbo/SCH chipset this fixup exists for is 32-bit only, and taking
+// USB away from the BIOS at PCI scan time is invasive enough that it should
+// not be compiled into architectures where it cannot be needed and has never
+// been exercised.
+#ifdef __i386__
+
+static void
+intel_fixup_ehci_bar(PCI *pci, uint8 domain, uint8 bus, uint8 device,
+	uint8 function, uint16 deviceId)
+{
+	if (deviceId != 0x8117)
+		return;
+
+	uint32 bar0 = pci->ReadConfig(domain, bus, device, function,
+		PCI_base_registers, 4);
+	if (bar0 == 0) {
+		dprintf("intel_fixup_ehci_bar: domain %u, bus %u, device %u, function "
+			"%u has an unassigned BAR0, assigning a fallback address\n",
+			domain, bus, device, function);
+		pci->WriteConfig(domain, bus, device, function, PCI_base_registers, 4,
+			0xf0000000);
+		bar0 = 0xf0000000;
+	}
+
+	// Take the EHCI controller away from the BIOS *now*, at PCI scan time,
+	// long before any USB controller driver initializes. On this chipset
+	// (Poulsbo/SCH, as found in the Sony VAIO P) the BIOS never
+	// acknowledges the normal EHCI legacy-support handoff -- the EHCI
+	// driver's own attempt later logs "bios won't give up control over the
+	// host controller" on every boot. The EHCI driver does force-clear the
+	// BIOS claim at that point, but by then it's too late for the
+	// full-speed devices on the *companion UHCI controllers*: those are
+	// lower PCI function numbers, so their drivers initialize and start
+	// enumerating devices while the BIOS still believes it owns USB and
+	// keeps intervening via SMM -- observed as UHCI "host process error"
+	// halts and a companion-port device (the internal Bluetooth module)
+	// failing SET_ADDRESS/GET_DESCRIPTOR forever during exactly that
+	// window. Clearing the BIOS's claim and all of its SMI enables here
+	// closes that window before any USB driver runs.
+	uint16 pciCommand = pci->ReadConfig(domain, bus, device, function,
+		PCI_command, 2);
+	pci->WriteConfig(domain, bus, device, function, PCI_command, 2,
+		pciCommand | PCI_command_memory);
+
+	// The extended capability pointer (EECP) lives in the MMIO HCCPARAMS
+	// register; the capability registers themselves are in PCI config
+	// space. Map the register window just long enough to read it.
+	uint8 eecp = 0;
+	void *regs = NULL;
+	area_id area = map_physical_memory("ehci bios handoff fixup",
+		bar0 & ~(phys_addr_t)0xfff, B_PAGE_SIZE, B_ANY_KERNEL_ADDRESS,
+		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, &regs);
+	if (area >= 0) {
+		uint32 hccparams
+			= *(volatile uint32 *)((uint8 *)regs + 8);
+		eecp = (hccparams >> 8) & 0xff;
+		delete_area(area);
+	}
+	if (eecp < 0x40) {
+		// Fall back to the SCH datasheet's fixed offset if the MMIO read
+		// wasn't possible; validated by the capability ID check below
+		// either way.
+		eecp = 0x68;
+	}
+
+	uint32 legacySupport = pci->ReadConfig(domain, bus, device, function,
+		eecp, 4);
+	if ((legacySupport & 0xff) != 0x01) {
+		dprintf("intel_fixup_ehci_bar: no legacy support capability at "
+			"0x%02x (0x%08" B_PRIx32 "), skipping early BIOS handoff\n",
+			eecp, legacySupport);
+		pci->WriteConfig(domain, bus, device, function, PCI_command, 2,
+			pciCommand);
+		return;
+	}
+
+	if ((legacySupport & (1 << 16)) != 0) {
+		// BIOS-owned: request ownership politely first.
+		pci->WriteConfig(domain, bus, device, function, eecp + 3, 1, 1);
+		for (int32 i = 0; i < 100; i++) {
+			legacySupport = pci->ReadConfig(domain, bus, device, function,
+				eecp, 4);
+			if ((legacySupport & (1 << 16)) == 0)
+				break;
+			spin(5000);
+		}
+	}
+
+	if ((legacySupport & (1 << 16)) != 0) {
+		dprintf("intel_fixup_ehci_bar: BIOS did not release the EHCI "
+			"controller, forcing the handoff\n");
+	} else {
+		dprintf("intel_fixup_ehci_bar: early EHCI BIOS handoff complete\n");
+	}
+
+	// Force the BIOS semaphore off and disable/clear every BIOS SMI source
+	// (USBLEGCTLSTS at EECP+4) regardless -- same hard-force the EHCI
+	// driver applies, just early enough to matter.
+	pci->WriteConfig(domain, bus, device, function, eecp + 2, 1, 0);
+	pci->WriteConfig(domain, bus, device, function, eecp + 4, 4, 0);
+
+	pci->WriteConfig(domain, bus, device, function, PCI_command, 2,
+		pciCommand);
+}
+
+#endif	// __i386__
+
+
 static void
 ati_fixup_ixp(PCI *pci, uint8 domain, uint8 bus, uint8 device, uint8 function,
 	uint16 deviceId)
@@ -206,6 +314,10 @@ pci_fixup_device(PCI *pci, uint8 domain, uint8 bus, uint8 device,
 
 		case 0x8086:
 			intel_fixup_ahci(pci, domain, bus, device, function, deviceId);
+#ifdef __i386__
+			intel_fixup_ehci_bar(pci, domain, bus, device, function,
+				deviceId);
+#endif
 			break;
 
 		case 0x1002:
