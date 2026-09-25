@@ -1962,26 +1962,95 @@ EHCI::CancelQueuedTransfers(Pipe *pipe, bool force)
 status_t
 EHCI::CancelQueuedIsochronousTransfers(Pipe *pipe, bool force)
 {
+	// This used to clear is_active and nothing else. The cancelled transfers'
+	// iTDs stayed linked in the periodic schedule and kept the controller
+	// reading out of buffers the caller frees right after cancelling, the
+	// transfer and descriptor memory leaked, and no B_CANCELED notification
+	// was ever delivered. Detach everything under the isochronous lock, then
+	// notify and free outside it -- the same rule FinishIsochronousTransfers
+	// follows.
+	if (!LockIsochronous())
+		return B_ERROR;
+
+	isochronous_transfer_data *canceledList = NULL;
+	isochronous_transfer_data **canceledTail = &canceledList;
+
 	isochronous_transfer_data *current = fFirstIsochronousTransfer;
+	isochronous_transfer_data *previous = NULL;
+	while (current != NULL) {
+		isochronous_transfer_data *next = current->link;
+		if (current->transfer != NULL
+				&& current->transfer->TransferPipe() == pipe) {
+			// Unlink every descriptor of this transfer still in the periodic
+			// schedule. Retiring a descriptor clears its prev, so a non-NULL
+			// prev means it is still chained to the frame it recorded at
+			// submit time.
+			for (uint32 i = 0; i <= current->last_to_process; i++) {
+				ehci_itd *itd = current->descriptors[i];
+				if (itd != NULL && itd->prev != NULL) {
+					UnlinkITDescriptors(itd,
+						&fItdEntries[itd->frame
+							& (EHCI_VFRAMELIST_ENTRIES_COUNT - 1)]);
+					itd->prev = NULL;
+					itd->next = NULL;
+				}
+			}
 
-	while (current) {
-		if (current->transfer->TransferPipe() == pipe) {
-			// TODO implement
+			if (previous != NULL)
+				previous->link = next;
+			else
+				fFirstIsochronousTransfer = next;
+			if (fLastIsochronousTransfer == current)
+				fLastIsochronousTransfer = previous;
 
-			// TODO: Use the force paramater in order to avoid calling
-			// invalid callbacks
 			current->is_active = false;
-		}
+			current->link = NULL;
+			*canceledTail = current;
+			canceledTail = &current->link;
+		} else
+			previous = current;
 
-		current = current->link;
+		current = next;
 	}
 
 	// The pipe's stream is over: its next submit must find a fresh slot near
 	// the controller rather than chaining off a stale frame.
 	ClearIsoAnchor(pipe);
 
-	TRACE_ERROR("no isochronous transfer found!\n");
-	return B_ERROR;
+	UnlockIsochronous();
+
+	if (canceledList == NULL)
+		return B_OK;
+
+	// Give the controller time to move past any frame whose chain it may have
+	// been traversing while we unlinked -- it looks at most one frame ahead.
+	// Only then is it safe to free the descriptors and buffers below, or for
+	// the caller to reuse its own data buffers.
+	snooze(2000);
+
+	isochronous_transfer_data *transfer = canceledList;
+	while (transfer != NULL) {
+		isochronous_transfer_data *next = transfer->link;
+
+		// The driver sees B_CANCELED and must not touch the pipe from the
+		// callback. force suppresses the callback entirely, for callers that
+		// can no longer guarantee it is safe.
+		if (!force)
+			transfer->transfer->Finished(B_CANCELED, 0);
+
+		for (uint32 i = 0; i <= transfer->last_to_process; i++)
+			FreeDescriptor(transfer->descriptors[i]);
+
+		delete [] transfer->descriptors;
+		delete transfer->transfer;
+		fStack->FreeChunk(transfer->buffer_log,
+			(phys_addr_t)transfer->buffer_phy, transfer->buffer_size);
+		delete transfer;
+
+		transfer = next;
+	}
+
+	return B_OK;
 }
 
 
