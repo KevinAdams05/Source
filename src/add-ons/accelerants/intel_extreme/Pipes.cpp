@@ -320,23 +320,35 @@ Pipe::ConfigureScalePos(display_mode* target)
 
 	// The only thing that really matters: set the image size and let the
 	// panel fitter or the transcoder worry about the rest
-	write32(INTEL_DISPLAY_A_PIPE_SIZE + fPipeOffset,
-		((uint32)(target->timing.h_display - 1) << 16)
-			| ((uint32)target->timing.v_display - 1));
+	uint32 pipeSizeValue = ((uint32)(target->timing.h_display - 1) << 16)
+		| ((uint32)target->timing.v_display - 1);
+	TRACE("%s: writing PIPE_SIZE +0x%" B_PRIxADDR ": 0x%08" B_PRIx32 "\n",
+		__func__, fPipeOffset, pipeSizeValue);
+	write32(INTEL_DISPLAY_A_PIPE_SIZE + fPipeOffset, pipeSizeValue);
 
 	// Set the plane size as well while we're at it (this is independant, we
 	// could have a larger plane and scroll through it).
 	if ((gInfo->shared_info->device_type.Generation() <= 4)
-		|| gInfo->shared_info->device_type.HasDDI()) {
+		|| gInfo->shared_info->device_type.HasDDI()
+		|| gInfo->shared_info->device_type.InGroup(INTEL_GROUP_VLV)
+		|| gInfo->shared_info->device_type.InGroup(INTEL_GROUP_CHV)) {
 		// This is "reserved" on G35 and GMA965, but needed on 945 (for which
 		// there is no public documentation), and I assume earlier devices as
 		// well.
 		//
 		// IMPORTANT WARNING: height and width are swapped when compared to the other registers!
 		// Be careful when editing this code and don't accidentally swap them!
-		write32(INTEL_DISPLAY_A_IMAGE_SIZE + fPipeOffset,
-			((uint32)(target->timing.v_display - 1) << 16)
-			| ((uint32)target->timing.h_display - 1));
+		uint32 imageSizeValue = ((uint32)(target->timing.v_display - 1) << 16)
+			| ((uint32)target->timing.h_display - 1);
+		TRACE("%s: writing IMAGE_SIZE +0x%" B_PRIxADDR ": 0x%08" B_PRIx32
+			" (VLV/CHV/DDI/gen<=4 path)\n", __func__, fPipeOffset,
+			imageSizeValue);
+		write32(INTEL_DISPLAY_A_IMAGE_SIZE + fPipeOffset, imageSizeValue);
+	} else {
+		TRACE("%s: NOT writing IMAGE_SIZE (gen %d, HasDDI=%d) -- register "
+			"left at whatever BIOS/GOP set it to\n", __func__,
+			gInfo->shared_info->device_type.Generation(),
+			gInfo->shared_info->device_type.HasDDI());
 	}
 }
 
@@ -635,8 +647,18 @@ Pipe::Enable(bool enable)
 	if (enable) {
 		write32(pipeReg, read32(pipeReg) | INTEL_PIPE_ENABLED);
 		wait_for_vblank();
-		write32(planeReg, (read32(planeReg) | DISPLAY_CONTROL_ENABLED)
-			& ~DISPLAY_CONTROL_TILE_MODE_MASK);
+		uint32 planeValueBefore = read32(planeReg);
+		uint32 planeValue = (planeValueBefore | DISPLAY_CONTROL_ENABLED)
+			& ~DISPLAY_CONTROL_TILE_MODE_MASK;
+
+		TRACE("%s: planeReg 0x%" B_PRIxADDR " before: 0x%08" B_PRIx32
+			", writing: 0x%08" B_PRIx32 "\n", __func__, planeReg,
+			planeValueBefore, planeValue);
+
+		write32(planeReg, planeValue);
+
+		TRACE("%s: planeReg 0x%" B_PRIxADDR " after: 0x%08" B_PRIx32 "\n",
+			__func__, planeReg, read32(planeReg));
 
 		//Enable default display main watermarks
 		if (gInfo->shared_info->pch_info == INTEL_PCH_CPT) {

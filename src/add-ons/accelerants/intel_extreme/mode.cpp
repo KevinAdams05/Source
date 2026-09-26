@@ -140,16 +140,24 @@ set_frame_buffer_registers(uint32 offset)
 		|| sharedInfo.device_type.InFamily(INTEL_FAMILY_SER5)
 		|| sharedInfo.device_type.InFamily(INTEL_FAMILY_LAKE)
 		|| sharedInfo.device_type.InFamily(INTEL_FAMILY_SOC0)) {
-		if (sharedInfo.device_type.InGroup(INTEL_GROUP_HAS)) {
+		if (sharedInfo.device_type.InGroup(INTEL_GROUP_HAS)
+			|| sharedInfo.device_type.InGroup(INTEL_GROUP_VLV)
+			|| sharedInfo.device_type.InGroup(INTEL_GROUP_CHV)) {
 //			|| sharedInfo.device_type.InGroup(INTEL_GROUP_SKY)) {
-			write32(INTEL_DISPLAY_A_OFFSET_HAS + offset,
-				((uint32)mode.v_display_start << 16)
-					| (uint32)mode.h_display_start);
+			uint32 offsetValue = ((uint32)mode.v_display_start << 16)
+				| (uint32)mode.h_display_start;
+			TRACE("%s: writing OFFSET_HAS-style register at +0x%" B_PRIx32
+				": 0x%08" B_PRIx32 " (v_display_start=%d, "
+				"h_display_start=%d)\n", __func__, offset, offsetValue,
+				mode.v_display_start, mode.h_display_start);
+			write32(INTEL_DISPLAY_A_OFFSET_HAS + offset, offsetValue);
 			read32(INTEL_DISPLAY_A_OFFSET_HAS + offset);
 		} else {
-			write32(INTEL_DISPLAY_A_BASE + offset,
-				mode.v_display_start * sharedInfo.bytes_per_row
-				+ mode.h_display_start * bytes_per_pixel);
+			uint32 baseValue = mode.v_display_start * sharedInfo.bytes_per_row
+				+ mode.h_display_start * bytes_per_pixel;
+			TRACE("%s: writing legacy BASE-style register at +0x%" B_PRIx32
+				": 0x%08" B_PRIx32 "\n", __func__, offset, baseValue);
+			write32(INTEL_DISPLAY_A_BASE + offset, baseValue);
 			read32(INTEL_DISPLAY_A_BASE + offset);
 		}
 		write32(INTEL_DISPLAY_A_SURFACE + offset, sharedInfo.frame_buffer_offset);
@@ -502,11 +510,22 @@ intel_set_display_mode(display_mode* mode)
 	// TODO rework this when we get multiple head support with different
 	// resolutions
 	if (sharedInfo.device_type.InFamily(INTEL_FAMILY_LAKE)) {
+		TRACE("%s: LAKE family, writing A=0x%" B_PRIx32 " (addr 0x%" B_PRIx32
+			") B=0x%" B_PRIx32 " (addr 0x%" B_PRIx32 ")\n", __func__,
+			bytesPerRow >> 6, (uint32)INTEL_DISPLAY_A_BYTES_PER_ROW,
+			bytesPerRow >> 6, (uint32)INTEL_DISPLAY_B_BYTES_PER_ROW);
 		write32(INTEL_DISPLAY_A_BYTES_PER_ROW, bytesPerRow >> 6);
 		write32(INTEL_DISPLAY_B_BYTES_PER_ROW, bytesPerRow >> 6);
 	} else {
+		TRACE("%s: non-LAKE, writing A=0x%" B_PRIx32 " (addr 0x%" B_PRIx32
+			") B=0x%" B_PRIx32 " (addr 0x%" B_PRIx32 ")\n", __func__,
+			bytesPerRow, (uint32)INTEL_DISPLAY_A_BYTES_PER_ROW,
+			bytesPerRow, (uint32)INTEL_DISPLAY_B_BYTES_PER_ROW);
 		write32(INTEL_DISPLAY_A_BYTES_PER_ROW, bytesPerRow);
 		write32(INTEL_DISPLAY_B_BYTES_PER_ROW, bytesPerRow);
+		TRACE("%s: read back A=0x%" B_PRIx32 " B=0x%" B_PRIx32 "\n",
+			__func__, read32(INTEL_DISPLAY_A_BYTES_PER_ROW),
+			read32(INTEL_DISPLAY_B_BYTES_PER_ROW));
 	}
 
 	// update shared info
