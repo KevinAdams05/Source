@@ -551,7 +551,12 @@ UHCI::UHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
 		fRootHubAddress(0),
 		fPortResetChange(0),
 		fIRQ(0),
-		fUseMSI(false)
+		fUseMSI(false),
+		fHostControllerHalted(false),
+		fHaltFrame(0),
+		fHaltStatus(0),
+		fHaltCommand(0),
+		fLinkedIsoTDs(0)
 {
 	// Initialized here rather than in the member list because
 	// B_SPINLOCK_INITIALIZER is a brace initializer whose shape changes
@@ -560,6 +565,7 @@ UHCI::UHCI(pci_info *info, pci_device_module_info* pci, pci_device* device, Stac
 
 	// Create a lock for the isochronous transfer list
 	mutex_init(&fIsochronousLock, "UHCI isochronous lock");
+
 
 	if (!fInitOK) {
 		TRACE_ERROR("bus manager failed to init\n");
@@ -1074,29 +1080,117 @@ UHCI::CancelQueuedTransfers(Pipe *pipe, bool force)
 status_t
 UHCI::CancelQueuedIsochronousTransfers(Pipe *pipe, bool force)
 {
+	// If the controller has halted, the finisher thread can no longer make
+	// progress (the frame counter is frozen), so it cannot complete these
+	// transfers. The pipe destructor calls us and then immediately calls
+	// WaitForIdle(), which panics ("USB object did not become idle!") if the
+	// transfers' references are still held. So complete them synchronously,
+	// right here in the calling thread - exactly like the regular
+	// CancelQueuedTransfers() does. The dead controller is not reading the
+	// frame list, so freeing the descriptors immediately is safe.
+	if (fHostControllerHalted) {
+		isochronous_transfer_data *removed = NULL;
+		if (!LockIsochronous())
+			return B_ERROR;
+
+		isochronous_transfer_data *current = fFirstIsochronousTransfer;
+		isochronous_transfer_data *prev = NULL;
+		while (current) {
+			isochronous_transfer_data *next = current->link;
+			if (current->transfer->TransferPipe() == pipe) {
+				// detach from the active list so the finisher cannot also
+				// touch it, then move it to our local free list
+				if (prev != NULL)
+					prev->link = next;
+				else
+					fFirstIsochronousTransfer = next;
+				if (current == fLastIsochronousTransfer)
+					fLastIsochronousTransfer = prev;
+
+				current->link = removed;
+				removed = current;
+			} else
+				prev = current;
+
+			current = next;
+		}
+
+		// Before we free any descriptors, make the frame list safe: point
+		// every frame back at the periodic interrupt queue and drop all
+		// per-frame iso bookkeeping. Otherwise the finisher thread (which may
+		// have just passed its halt check and be snoozing) could wake up and
+		// walk fFrameList straight into the descriptors we are about to free
+		// (use-after-free -> general protection fault). Done under the same
+		// lock as the detach so there is no window. The controller is halted,
+		// so every isochronous stream is already dead.
+		for (int32 frame = 0; frame < NUMBER_OF_FRAMES; frame++) {
+			fFirstIsochronousDescriptor[frame] = NULL;
+			fLastIsochronousDescriptor[frame] = NULL;
+			fFrameBandwidth[frame] = MAX_AVAILABLE_BANDWIDTH;
+			fFrameList[frame] = fQueues[UHCI_INTERRUPT_QUEUE]->PhysicalAddress()
+				| FRAMELIST_NEXT_IS_QH;
+		}
+		UnlockIsochronous();
+
+		bool found = (removed != NULL);
+		while (removed != NULL) {
+			isochronous_transfer_data *next = removed->link;
+
+			// Deleting the Transfer releases its reference on the pipe (this
+			// is what lets WaitForIdle() succeed); skip the callback when
+			// forced, as the regular cancel path does.
+			if (!force)
+				removed->transfer->Finished(B_CANCELED, 0);
+
+			uint32 packetCount
+				= removed->transfer->IsochronousData()->packet_count;
+			for (uint32 i = 0; i < packetCount; i++)
+				FreeDescriptor(removed->descriptors[i]);
+
+			delete [] removed->descriptors;
+			delete removed->transfer;
+			delete removed;
+			removed = next;
+		}
+
+		if (!found)
+			TRACE_ERROR("no isochronous transfer found!\n");
+		return found ? B_OK : B_ERROR;
+	}
+
+	// Normal path (controller running): mark the descriptors inactive and let
+	// the finisher thread complete the transfers as the controller advances
+	// past their frames.
 	isochronous_transfer_data *current = fFirstIsochronousTransfer;
+	bool found = false;
 
 	while (current) {
 		if (current->transfer->TransferPipe() == pipe) {
 			int32 packetCount
 				= current->transfer->IsochronousData()->packet_count;
-			// Set the active bit off on every descriptor in order to prevent
-			// the controller from processing them. Then set off the is_active
-			// field of the transfer in order to make the finisher thread skip
-			// the transfer. The FinishIsochronousThread will do the rest.
+			// Clear the active bit on every descriptor so the controller
+			// stops processing them, then clear is_active so the finisher
+			// thread skips the Finished() callback and just frees the memory.
 			for (int32 i = 0; i < packetCount; i++)
 				current->descriptors[i]->status &= ~TD_STATUS_ACTIVE;
 
-			// TODO: Use the force paramater in order to avoid calling
-			// invalid callbacks
 			current->is_active = false;
+			found = true;
 		}
 
 		current = current->link;
 	}
 
-	TRACE_ERROR("no isochronous transfer found!\n");
-	return B_ERROR;
+	// Wake the finisher so it walks the frame list and frees the canceled
+	// transfers: their descriptors are inactive now and raise no completion
+	// interrupts, and the pipe destructor's WaitForIdle() blocks until the
+	// finisher has dropped every reference.
+	if (found)
+		release_sem_etc(fFinishIsochronousTransfersSem, 1, B_DO_NOT_RESCHEDULE);
+
+	if (!found)
+		TRACE_ERROR("no isochronous transfer found!\n");
+	return found ? B_OK : B_ERROR;
 }
 
 
@@ -2047,6 +2141,13 @@ UHCI::RecoverFromHalt()
 
 	WriteReg16(UHCI_USBCMD, ReadReg16(UHCI_USBCMD) | UHCI_USBCMD_RS);
 
+	// The controller is running again, so clear the halted flag the interrupt
+	// handler set. Without this the two halt paths would disagree: recovery
+	// would restart the controller while fHostControllerHalted stayed true,
+	// and every later pipe teardown would keep completing transfers
+	// synchronously as though the controller were still dead.
+	fHostControllerHalted = false;
+
 	TRACE_ALWAYS("host controller halt recovery complete\n");
 }
 
@@ -2242,9 +2343,15 @@ UHCI::Interrupt()
 
 	if (status & UHCI_USBSTS_HCPRERR) {
 		TRACE_MODULE_ERROR("process error\n");
+		// Capture schedule state to report why the controller's consistency
+		// check failed (logged below as "HALT DIAG").
+		fHaltStatus = status;
+		fHaltFrame = ReadReg16(UHCI_FRNUM);
+		fHaltCommand = ReadReg16(UHCI_USBCMD);
 		acknowledge |= UHCI_USBSTS_HCPRERR;
 	}
 
+	bool controllerHalted = false;
 	if (status & UHCI_USBSTS_HCHALT) {
 		TRACE_MODULE_ERROR("host controller halted\n");
 		// Disable interrupts immediately so we do not flood the system with
@@ -2258,6 +2365,26 @@ UHCI::Interrupt()
 			fControllerHalted = true;
 			finishTransfers = true;
 		}
+		if ((status & UHCI_USBSTS_HCPRERR) == 0) {
+			fHaltStatus = status;
+			fHaltFrame = ReadReg16(UHCI_FRNUM);
+			fHaltCommand = ReadReg16(UHCI_USBCMD);
+		}
+		// Flag the halt and wake the finisher threads so they stop walking the
+		// now-frozen frame list. Outstanding transfers are completed
+		// synchronously during pipe teardown (CancelQueuedIsochronousTransfers
+		// / CancelQueuedTransfers), which lets WaitForIdle() return instead of
+		// panicking. The controller stays down until the next reboot.
+		//
+		// This is a net for a reproduced failure, not a precaution: a USB
+		// audio device streaming isochronous over UHCI hit HCPRERR about 30 s
+		// in and took the machine down with "USB object did not become idle!".
+		// See the fHostControllerHalted comment in uhci.h.
+		fHostControllerHalted = true;
+		controllerHalted = true;
+		dprintf("usb uhci: HALT DIAG usbsts=0x%04x usbcmd=0x%04x frnum=%u "
+			"linkedIsoTDs=%" B_PRId32 "\n", fHaltStatus, fHaltCommand,
+			fHaltFrame, fLinkedIsoTDs);
 		// acknowledge not needed
 	}
 
@@ -2266,8 +2393,10 @@ UHCI::Interrupt()
 
 	release_spinlock(&fInterruptLock);
 
-	if (finishTransfers)
+	if (finishTransfers || controllerHalted)
 		release_sem_etc(fFinishTransfersSem, 1, B_DO_NOT_RESCHEDULE);
+	if (controllerHalted)
+		release_sem_etc(fFinishIsochronousTransfersSem, 1, B_DO_NOT_RESCHEDULE);
 
 	return result;
 }
