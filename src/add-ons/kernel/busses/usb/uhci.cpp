@@ -862,19 +862,18 @@ UHCI::SubmitTransfer(Transfer *transfer)
 	if (pipe->DeviceAddress() == fRootHubAddress)
 		return fRootHub->ProcessTransfer(this, transfer);
 
+	// If the controller has halted on a fatal error, refuse new transfers
+	// instead of queuing them into a dead schedule.
+	if (fHostControllerHalted)
+		return B_ERROR;
+
 	TRACE("submit transfer called for device %d\n", pipe->DeviceAddress());
 	if (pipe->Type() & USB_OBJECT_CONTROL_PIPE)
 		return SubmitRequest(transfer);
 
 	// Process isochronous transfers
-#if 0
 	if (pipe->Type() & USB_OBJECT_ISO_PIPE)
 		return SubmitIsochronous(transfer);
-#else
-	// At present, isochronous transfers cause busylooping, and do not seem to work.
-	if (pipe->Type() & USB_OBJECT_ISO_PIPE)
-		return B_NOT_SUPPORTED;
-#endif
 
 	uhci_td *firstDescriptor = NULL;
 	uhci_qh *transferQueue = NULL;
@@ -1376,12 +1375,41 @@ UHCI::SubmitIsochronous(Transfer *transfer)
 	Pipe *pipe = transfer->TransferPipe();
 	bool directionIn = (pipe->Direction() == Pipe::In);
 	usb_isochronous_data *isochronousData = transfer->IsochronousData();
+
+	// A zero packet count would divide by zero below (and has: usb_audio used
+	// to submit unconfigured streams after a device replug -> KDL).
+	if (isochronousData->packet_count == 0) {
+		TRACE_ERROR("rejecting isochronous transfer with zero packet count\n");
+		return B_BAD_VALUE;
+	}
+
 	size_t packetSize = transfer->DataLength();
 	size_t restSize = packetSize % isochronousData->packet_count;
 	packetSize /= isochronousData->packet_count;
 	uint16 currentFrame;
 
-	if (packetSize > pipe->MaxPacketSize()) {
+	// Honor the caller's per-packet lengths when they are coherent (sum to
+	// the transfer length). usb_audio uses this for the 44.1kHz 44/45-frame
+	// cadence; uniform slicing would otherwise put the leftover bytes into a
+	// bogus short last packet.
+	bool usePacketLengths = false;
+	if (isochronousData->packet_descriptors != NULL) {
+		size_t sum = 0;
+		size_t maxLength = 0;
+		for (uint32 i = 0; i < isochronousData->packet_count; i++) {
+			size_t length = isochronousData->packet_descriptors[i]
+				.request_length;
+			sum += length;
+			if (length > maxLength)
+				maxLength = length;
+		}
+		if (sum == transfer->DataLength() && maxLength > 0
+				&& maxLength <= pipe->MaxPacketSize()) {
+			usePacketLengths = true;
+		}
+	}
+
+	if (!usePacketLengths && packetSize > pipe->MaxPacketSize()) {
 		TRACE_ERROR("isochronous packetSize is bigger than pipe MaxPacketSize\n");
 		return B_BAD_VALUE;
 	}
@@ -1405,8 +1433,11 @@ UHCI::SubmitIsochronous(Transfer *transfer)
 
 	// Create the list of transfer descriptors
 	for (uint32 i = 0; i < (isochronousData->packet_count - 1); i++) {
+		size_t length = usePacketLengths
+			? isochronousData->packet_descriptors[i].request_length
+			: packetSize;
 		isoRequest[i] = CreateDescriptor(pipe,
-			directionIn ? TD_TOKEN_IN : TD_TOKEN_OUT, packetSize);
+			directionIn ? TD_TOKEN_IN : TD_TOKEN_OUT, length);
 		// If we ran out of memory, clean up and return
 		if (isoRequest[i] == NULL) {
 			for (uint32 j = 0; j < i; j++)
@@ -1420,9 +1451,12 @@ UHCI::SubmitIsochronous(Transfer *transfer)
 
 	// Create the last transfer descriptor which should be of smaller size
 	// and set the IOC bit
+	size_t lastLength = usePacketLengths
+		? isochronousData->packet_descriptors[isochronousData->packet_count
+			- 1].request_length
+		: ((restSize) ? restSize : packetSize);
 	isoRequest[isochronousData->packet_count - 1] = CreateDescriptor(pipe,
-		directionIn ? TD_TOKEN_IN : TD_TOKEN_OUT,
-		(restSize) ? restSize : packetSize);
+		directionIn ? TD_TOKEN_IN : TD_TOKEN_OUT, lastLength);
 	// If we are that unlucky...
 	if (!isoRequest[isochronousData->packet_count - 1]) {
 		for (uint32 i = 0; i < (isochronousData->packet_count - 2); i++)
@@ -1459,9 +1493,35 @@ UHCI::SubmitIsochronous(Transfer *transfer)
 		// 3. There is enough bandwidth in the first entry
 		currentFrame = (currentFrame + 5) % NUMBER_OF_FRAMES;
 	} else {
-		// Find out if the frame number specified has enough bandwidth,
-		// otherwise find the first next available frame with enough bandwidth
-		currentFrame = *isochronousData->starting_frame_number;
+		// A specific start frame was requested. Drivers that stream
+		// continuously (e.g. usb_audio) use this to chain their transfers
+		// back-to-back, one packet per frame, which is what keeps an
+		// isochronous endpoint at its real-time rate. Mask the value into the
+		// frame-list range (the caller does not know NUMBER_OF_FRAMES, so it
+		// may hand us an ever-increasing frame number), and if the requested
+		// frame is not safely ahead of the controller - i.e. the chain has
+		// fallen behind and the controller already reached/passed it - fall
+		// back to FRNUM+5 as for ASAP so we never queue into a passed frame.
+		currentFrame = *isochronousData->starting_frame_number
+			% NUMBER_OF_FRAMES;
+		uint16 frnum = ReadReg16(UHCI_FRNUM) & (NUMBER_OF_FRAMES - 1);
+		uint16 ahead = (currentFrame - frnum) & (NUMBER_OF_FRAMES - 1);
+		if (ahead < 2 || ahead > (NUMBER_OF_FRAMES / 2)) {
+			// Every fallback breaks stream continuity (up to a 5ms gap on the
+			// wire) and is audible as a sporadic glitch, so it is worth a
+			// syslog line - but rate-limited: this runs in the submit path.
+			static int32 sChainFallbacks = 0;
+			static bigtime_t sChainFallbackLastLog = 0;
+			int32 count = atomic_add(&sChainFallbacks, 1) + 1;
+			bigtime_t now = system_time();
+			if (now - sChainFallbackLastLog >= 10000000) {
+				sChainFallbackLastLog = now;
+				dprintf("uhci: iso chain fallback #%" B_PRId32 " (requested"
+					" frame %u, frnum %u, ahead %u)\n", count, currentFrame,
+					frnum, ahead);
+			}
+			currentFrame = (frnum + 5) % NUMBER_OF_FRAMES;
+		}
 	}
 
 	// Find the first entry with enough bandwidth
@@ -1562,6 +1622,7 @@ UHCI::LinkIsochronousDescriptor(uhci_td *descriptor, uint16 frame)
 
 		descriptor->link_phy
 			= fQueues[UHCI_INTERRUPT_QUEUE]->PhysicalAddress() | TD_NEXT_IS_QH;
+		atomic_add(&fLinkedIsoTDs, 1);
 		UnlockIsochronous();
 		return B_OK;
 	}
@@ -1585,6 +1646,7 @@ UHCI::UnlinkIsochronousDescriptor(uint16 frame)
 				fFirstIsochronousDescriptor[frame] = NULL;
 				fLastIsochronousDescriptor[frame] = NULL;
 			}
+			atomic_add(&fLinkedIsoTDs, -1);
 		}
 		UnlockIsochronous();
 		return descriptor;
@@ -1938,37 +2000,73 @@ UHCI::FinishIsochronousThread(void *data)
 void
 UHCI::FinishIsochronousTransfers()
 {
-	/* This thread stays one position behind the controller and processes every
-	 * isochronous descriptor. Once it finds the last isochronous descriptor
-	 * of a transfer, it processes the entire transfer.
-	 */
+	// currentFrame persists across wake-ups so the frame list is walked
+	// CONTINUOUSLY, never skipping a frame: a transfer's descriptors span
+	// consecutive frames and are all freed only when its LAST descriptor is
+	// reached, so a descriptor left linked in a skipped frame would be freed
+	// under the running controller -> fatal HC process error.
+	//
+	// We still complete only ONE transfer per wake-up, paced by the
+	// SubmitIsochronous() semaphore and the snooze() below. The submit sem is
+	// posted once per queued transfer, and usb_audio queues the next buffer
+	// from each completion callback, so blocking on it here ties the
+	// completion rate to the controller's real-time pace. (Draining the whole
+	// passed-frame backlog per wake-up instead completes transfers in bursts
+	// and makes playback run several times too fast.)
+	uint16 currentFrame = ReadReg16(UHCI_FRNUM) & (NUMBER_OF_FRAMES - 1);
 
 	while (!fStopThreads) {
-		// Go to sleep if there are not isochronous transfer to process
+		// Wait until a transfer has been queued and needs completing.
 		if (acquire_sem(fFinishIsochronousTransfersSem) < B_OK)
 			return;
 
+		// On a dead controller do not walk the (frozen) frame list at all;
+		// CancelQueuedIsochronousTransfers() completes the transfers
+		// synchronously during pipe teardown instead.
+		if (fHostControllerHalted)
+			continue;
+
 		bool transferDone = false;
-		uint16 currentFrame = ReadReg16(UHCI_FRNUM);
+		while (!transferDone && !fStopThreads) {
+			if (fHostControllerHalted)
+				break;
 
-		// Process the frame list until one transfer is processed
-		while (!transferDone) {
-			// wait 1ms in order to be sure to be one position behind
-			// the controller
-			if (currentFrame == ReadReg16(UHCI_FRNUM))
-				snooze(1000);
+			// No isochronous transfers left at all (everything completed or
+			// canceled and freed): go back to sleep instead of walking empty
+			// frames waiting for a completion that cannot come. Any leftover
+			// sem counts from canceled transfers drain through this check one
+			// wake at a time. Safe unlocked read: SubmitIsochronous() adds to
+			// the list BEFORE posting the sem, so a new transfer missed here
+			// re-wakes us immediately.
+			if (fFirstIsochronousTransfer == NULL)
+				break;
 
-			// Process the frame till it has isochronous descriptors in it.
+			// Wait until the controller has moved strictly PAST currentFrame
+			// before touching it. A single snooze() is not enough: if it
+			// returns before the frame number has advanced we would process the
+			// frame the controller is still on and then step currentFrame
+			// AHEAD of it, completing transfers before they are actually sent
+			// -> playback runs several times too fast. Looping here pins us one
+			// frame behind the controller, i.e. at its real-time rate.
+			while (currentFrame
+					== (ReadReg16(UHCI_FRNUM) & (NUMBER_OF_FRAMES - 1))) {
+				if (fStopThreads || fHostControllerHalted)
+					break;
+				snooze(500);
+			}
+
+			if (fHostControllerHalted || fStopThreads)
+				break;
+
+			// Process the frame till it has no more isochronous descriptors.
 			while (!(fFrameList[currentFrame] & FRAMELIST_NEXT_IS_QH)) {
 				uhci_td *current = UnlinkIsochronousDescriptor(currentFrame);
 
-				// Process the transfer if we found the last descriptor
+				// FindIsochronousTransfer returns non-NULL only for a
+				// transfer's LAST descriptor; earlier descriptors are simply
+				// unlinked here and freed when their transfer completes.
 				isochronous_transfer_data *transfer
 					= FindIsochronousTransfer(current);
-					// Process the descriptors only if it is still active and
-					// belongs to an inbound transfer. If the transfer is not
-					// active, it means the request has been removed, so simply
-					// remove the descriptors.
 				if (transfer && transfer->is_active) {
 					if (current->token & TD_TOKEN_IN) {
 						generic_io_vec *vector = transfer->transfer->Vector();
@@ -1985,12 +2083,13 @@ UHCI::FinishIsochronousTransfers()
 						} else {
 							isochronous_transfer_data *temp
 								= fFirstIsochronousTransfer;
-							while (transfer != temp->link)
+							while (temp != NULL && transfer != temp->link)
 								temp = temp->link;
 
 							if (transfer == fLastIsochronousTransfer)
 								fLastIsochronousTransfer = temp;
-							temp->link = temp->link->link;
+							if (temp != NULL && temp->link != NULL)
+								temp->link = temp->link->link;
 						}
 						UnlockIsochronous();
 					}
@@ -2005,11 +2104,45 @@ UHCI::FinishIsochronousTransfers()
 					delete [] transfer->descriptors;
 					delete transfer->transfer;
 					delete transfer;
+
+					// One completion per wake-up keeps the rate real-time.
+					transferDone = true;
+				} else if (transfer) {
+					// Transfer was cancelled: remove and free without
+					// invoking the callback (caller already cleaned up).
+					if (LockIsochronous()) {
+						if (transfer == fFirstIsochronousTransfer) {
+							fFirstIsochronousTransfer = transfer->link;
+							if (transfer == fLastIsochronousTransfer)
+								fLastIsochronousTransfer = NULL;
+						} else {
+							isochronous_transfer_data *temp
+								= fFirstIsochronousTransfer;
+							while (temp != NULL && transfer != temp->link)
+								temp = temp->link;
+
+							if (transfer == fLastIsochronousTransfer)
+								fLastIsochronousTransfer = temp;
+							if (temp != NULL && temp->link != NULL)
+								temp->link = temp->link->link;
+						}
+						UnlockIsochronous();
+					}
+
+					uint32 packetCount =
+						transfer->transfer->IsochronousData()->packet_count;
+					for (uint32 i = 0; i < packetCount; i++)
+						FreeDescriptor(transfer->descriptors[i]);
+
+					delete [] transfer->descriptors;
+					delete transfer->transfer;
+					delete transfer;
+
 					transferDone = true;
 				}
 			}
 
-			// Make sure to reset the frame bandwidth
+			// Reset this frame's bandwidth and advance to the next one.
 			fFrameBandwidth[currentFrame] = MAX_AVAILABLE_BANDWIDTH;
 			currentFrame = (currentFrame + 1) % NUMBER_OF_FRAMES;
 		}
