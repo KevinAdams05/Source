@@ -1020,22 +1020,36 @@ XHCI::SubmitNormalRequest(Transfer *transfer)
 		}
 	}
 
-	xhci_td* td = CreateDescriptor(trbCount, trbCount, trbSize);
+	// Isochronous packets may differ in size, but WriteDescriptor() and
+	// ReadDescriptor() fill the TD's buffers linearly at a fixed stride. With
+	// one buffer per packet, every packet shorter than trbSize would leave a
+	// gap that the stride skips over, shifting all later packets' data. So
+	// give an isochronous transfer one contiguous buffer instead, and point
+	// each packet's TRB into it at its cumulative offset.
+	xhci_td* td;
+	if (isochronousData != NULL)
+		td = CreateDescriptor(trbCount, 1, transfer->FragmentLength());
+	else
+		td = CreateDescriptor(trbCount, trbCount, trbSize);
 	if (td == NULL)
 		return B_NO_MEMORY;
 
 	// Normal Stage
 	const size_t maxPacketSize = pipe->MaxPacketSize();
 	size_t remaining = transfer->FragmentLength();
+	size_t isochronousOffset = 0;
 	for (int32 i = 0; i < trbCount; i++) {
 		phys_addr_t address;
 		generic_size_t trbLength;
 		if (!transfer->IsPhysical()) {
-			address = td->buffer_addrs[i];
-			if (isochronousData != NULL)
+			if (isochronousData != NULL) {
+				address = td->buffer_addrs[0] + isochronousOffset;
 				trbLength = isochronousData->packet_descriptors[i].request_length;
-			else
+				isochronousOffset += trbLength;
+			} else {
+				address = td->buffer_addrs[i];
 				trbLength = (remaining < trbSize) ? remaining : trbSize;
+			}
 		} else {
 			address = transferVec->base + transferVecOffset;
 			trbLength = transferVec->length - transferVecOffset;
