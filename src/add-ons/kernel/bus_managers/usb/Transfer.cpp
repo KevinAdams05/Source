@@ -270,11 +270,11 @@ Transfer::_CalculateBandwidth()
 			// Direction doesn't matter for highspeed
 			if (type & USB_OBJECT_ISO_PIPE)
 				bandwidthNS = (uint32)((38 * 8 * 2.083)
-					+ (2.083 * ((uint32)(3.167 * (1.1667 * 8 * fData.length))))
+					+ (2.083 * ((uint32)(3.167 + (1.1667 * 8 * fData.length))))
 					+ USB_BW_HOST_DELAY);
 			else
 				bandwidthNS = (uint32)((55 * 8 * 2.083)
-					+ (2.083 * ((uint32)(3.167 * (1.1667 * 8 * fData.length))))
+					+ (2.083 * ((uint32)(3.167 + (1.1667 * 8 * fData.length))))
 					+ USB_BW_HOST_DELAY);
 			break;
 		}
