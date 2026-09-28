@@ -49,10 +49,21 @@ Object::PutUSBID(bool waitForIdle)
 void
 Object::WaitForIdle()
 {
-	int32 retries = 20;
-	while (CountReferences() != 1 && retries--)
+	// Cancelled isochronous transfers are only freed by the host controller's
+	// finisher thread as the controller's frame counter passes their frames,
+	// and a start-frame chain can sit hundreds of frames ahead of the
+	// controller -- on UHCI, up to 512 frames, so half a second. A starved
+	// stream runs its chain out to that limit, which means teardown after an
+	// unplug legitimately takes just over half a second. 20 retries is 2 ms.
+	int32 retries = 20000;
+	while (CountReferences() != 1 && retries-- > 0)
 		snooze(100);
-	if (retries <= 0)
+
+	// Test the reference count, not the retry counter. `retries--` is a post
+	// decrement that is skipped entirely when the && short-circuits, so an
+	// object that went idle on the final retry leaves retries at 0 and the
+	// old condition panicked on it despite the wait having succeeded.
+	if (CountReferences() != 1)
 		panic("USB object did not become idle! @! calling -m usb");
 }
 
