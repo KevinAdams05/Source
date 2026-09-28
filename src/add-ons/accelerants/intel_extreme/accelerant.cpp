@@ -486,6 +486,82 @@ assign_pipes()
 }
 
 
+//     #pragma mark - VLV/CHV DSI
+
+/*! On VLV/CHV, Haiku has no MIPI DSI port-probing logic, so no port ever
+ * reports IsConnected() and the normal Port::SetDisplayMode() path --
+ * which would otherwise call Pipe::ConfigureTimings()/ConfigureScalePos()
+ * -- never runs. This directly invokes those same Pipe methods using the
+ * VBT-derived panel_timing, so Haiku explicitly programs the pipe/
+ * transcoder timing and size registers instead of leaving them at
+ * whatever BIOS/GOP configured before boot.
+ *
+ * This is NOT a temporary workaround: it is currently the only code path
+ * that programs these registers for VLV/CHV at all, and removing it
+ * reintroduces a picture that is offset/sliced relative to the panel.
+ *
+ * This does NOT implement DSI panel bring-up (D-PHY/lane init, MIPI
+ * command sequences, device-ready handshake) -- it relies on BIOS having
+ * already brought the DSI link up and holding it in a working state,
+ * which matches every VLV/CHV boot observed so far (panel displays
+ * content; only pipe/plane-level timing needed correcting).
+ */
+static status_t
+vlv_configure_pipe_from_vbt()
+{
+	if (!gInfo->shared_info->device_type.InGroup(INTEL_GROUP_VLV)
+		&& !gInfo->shared_info->device_type.InGroup(INTEL_GROUP_CHV)) {
+		return B_OK; // not applicable, nothing to do
+	}
+
+	if (gInfo->port_count > 0) {
+		for (uint32 i = 0; i < gInfo->port_count; i++) {
+			if (gInfo->ports[i]->IsConnected()) {
+				TRACE("%s: a port reports connected, skipping -- normal "
+					"path should handle this\n", __func__);
+				return B_OK;
+			}
+		}
+	}
+
+	if (!gInfo->shared_info->got_vbt) {
+		ERROR("%s: no VBT data available, cannot build a fallback mode\n",
+			__func__);
+		return B_ERROR;
+	}
+
+	display_timing& panelTiming = gInfo->shared_info->panel_timing;
+	if (panelTiming.h_display == 0 || panelTiming.v_display == 0) {
+		ERROR("%s: VBT panel_timing looks empty (%dx%d), not proceeding\n",
+			__func__, panelTiming.h_display, panelTiming.v_display);
+		return B_ERROR;
+	}
+
+	if (gInfo->pipe_count == 0 || gInfo->pipes[0] == NULL) {
+		ERROR("%s: no Pipe A object available\n", __func__);
+		return B_ERROR;
+	}
+
+	display_mode mode = {};
+	mode.timing = panelTiming;
+	mode.space = B_RGB32;
+	mode.virtual_width = panelTiming.h_display;
+	mode.virtual_height = panelTiming.v_display;
+
+	TRACE("%s: configuring Pipe A from VBT panel_timing %dx%d (h_total %d, "
+		"v_total %d)\n", __func__, panelTiming.h_display,
+		panelTiming.v_display, panelTiming.h_total, panelTiming.v_total);
+
+	// INTEL_PORT_A: VLV's single internal DSI panel is wired as the first/
+	// primary port. ConfigureTimings()'s only use of portIndex is an
+	// SNB/IVB-specific early-return check that does not apply to VLV/CHV.
+	gInfo->pipes[0]->ConfigureTimings(&mode, true, INTEL_PORT_A);
+	gInfo->pipes[0]->Enable(true);
+
+	return B_OK;
+}
+
+
 static void
 disable_fences()
 {
@@ -531,6 +607,8 @@ intel_init_accelerant(int device)
 
 	if (status != B_OK)
 		ERROR("Warning: zero active displays were found!\n");
+
+	vlv_configure_pipe_from_vbt();
 
 	status = assign_pipes();
 
