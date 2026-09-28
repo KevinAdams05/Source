@@ -267,6 +267,56 @@ inline	uint32						ReadReg32(uint32 reg);
 		uint32						fIRQ;
 		bool						fUseMSI;
 		spinlock					fInterruptLock;
+
+		// Fatal-error handling: set when the
+		// controller signals a process error / halt. Outstanding transfers are
+		// then completed with an error so the USB stack's WaitForIdle() does
+		// not block forever (which otherwise panics: "USB object did not
+		// become idle!"). The controller is not restarted; it stays down until
+		// reboot, so only the halted instance dies and the other UHCI/EHCI
+		// controllers keep working.
+		//
+		// WHY THIS EXISTS -- it is not defensive, it was a reproduced failure.
+		// Measured with a Pioneer DDJ-SR (08e4:0183) streaming isochronous
+		// over UHCI: clean for ~30 s, then
+		//     usb uhci: process error
+		//     usb uhci: host controller halted
+		// (USBSTS bit 4, HCPRERR -- the controller failed a consistency check
+		// on a TD and cleared Run/Stop), followed by the WaitForIdle panic.
+		// The KDL itself was unobtainable: syslog_daemon dies before the lines
+		// reach disk, so only a live ssh tail caught them.
+		//
+		// With this handling in place, same hardware, same day: the log shows
+		// process error -> host controller halted -> the HALT DIAG line below,
+		// and the box STAYS ALIVE. No "not idle", no GPF, no KDL.
+		//
+		// ⚠️ A tempting wrong answer was tested and REFUTED. The leading
+		// hypothesis was that our own per-cycle dprintf spam caused the halt
+		// (each line blocks ~5 ms on a 115200 UART with serial_debug_output on,
+		// which would starve the finisher). The spam was removed and it still
+		// process-errored at ~30 s. The cause was the isochronous scheduling
+		// itself, which the rework in this series addresses.
+		//
+		// ⚠️ The cause is believed fixed by that rework -- the same device has
+		// played clean since -- so this path is not expected to fire. It is
+		// the net, not the fix. Do not remove it on the grounds that it never
+		// triggers; what it catches is a kernel panic.
+		bool						fHostControllerHalted;
+		// Schedule state captured at halt time, reported by the finisher. The
+		// capture above read usbsts=0x0030 (HCPRERR|HCHalted), usbcmd=0x0080
+		// (Run/Stop cleared), frnum=468.
+		uint16						fHaltFrame;
+		uint16						fHaltStatus;
+		uint16						fHaltCommand;
+		// Running count of isochronous TDs currently linked into the frame
+		// list (Link++ / Unlink--). Added specifically to decide the cause of
+		// the HC process error above: hundreds at halt time would confirm the
+		// finisher had fallen behind and overrun the schedule; tens would point
+		// at a malformed TD or a controller-read race instead.
+		// ⚠️ Never actually measured: the scheduling rework landed first and
+		// the halt stopped reproducing, so the question it was built to answer
+		// is still open.
+		int32						fLinkedIsoTDs;
 };
 
 
