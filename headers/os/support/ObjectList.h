@@ -104,9 +104,12 @@ public:
 	bool ReplaceItem(int32, void *);
 	bool MoveItem(int32 from, int32 to);
 
+protected:
+	bool _IsLegacyOwning() const { return fLegacyOwning; }
+
 private:
 	bool	fLegacyOwning;
-		// here only for API/ABI compatibility
+		// set by BObjectList's legacy (itemsPerBlock, owning) constructor
 };
 
 
@@ -121,6 +124,12 @@ public:
 									void* state);
 
 								BObjectList(int32 itemsPerBlock = 20);
+								BObjectList(int32 itemsPerBlock, bool owning);
+									// source compatibility with code written
+									// before "owning" became a template
+									// parameter; owning == true makes this
+									// list delete its items like an Owning
+									// list does
 								BObjectList(const BObjectList& list);
 									// clones list; if list is owning, makes
 									// copies of all the items
@@ -249,6 +258,8 @@ private:
 	friend	class Private;
 
 			void				_SetItem(int32, T*);
+			bool				_IsOwning() const
+									{ return Owning || _IsLegacyOwning(); }
 };
 
 
@@ -415,12 +426,20 @@ BObjectList<T, Owning>::BObjectList(int32 itemsPerBlock)
 }
 
 
+template<class T, bool Owning>
+BObjectList<T, Owning>::BObjectList(int32 itemsPerBlock, bool owning)
+	:
+	_PointerList_(itemsPerBlock, Owning || owning)
+{
+}
+
+
 template<class T, bool O>
 BObjectList<T, O>::BObjectList(const BObjectList<T, O>& list)
 	:
 	_PointerList_(list)
 {
-	if (O) {
+	if (_IsOwning()) {
 		// make our own copies in an owning list
 		int32 count = list.CountItems();
 		for	(int32 index = 0; index < count; index++) {
@@ -436,7 +455,7 @@ BObjectList<T, O>::BObjectList(const BObjectList<T, O>& list)
 template<class T, bool Owning>
 BObjectList<T, Owning>::~BObjectList()
 {
-	if (Owning) {
+	if (_IsOwning()) {
 		// have to nuke elements first
 		MakeEmpty();
 	}
@@ -448,7 +467,7 @@ BObjectList<T, Owning>&
 BObjectList<T, Owning>::operator=(const BObjectList<T, Owning>& list)
 {
 	BObjectList<T, Owning> &result = (BObjectList<T, Owning>&)_PointerList_::operator=(list);
-	if (Owning) {
+	if (_IsOwning()) {
 		// make our own copies in an owning list
 		int32 count = list.CountItems();
 		for	(int32 index = 0; index < count; index++) {
@@ -501,7 +520,7 @@ BObjectList<T, Owning>::RemoveItem(T* item, bool deleteIfOwning)
 {
 	bool result = _PointerList_::RemoveItem((void*)item);
 
-	if (result && Owning && deleteIfOwning)
+	if (result && _IsOwning() && deleteIfOwning)
 		delete item;
 
 	return result;
@@ -528,7 +547,7 @@ template<class T, bool Owning>
 bool
 BObjectList<T, Owning>::ReplaceItem(int32 index, T* item)
 {
-	if (Owning)
+	if (_IsOwning())
 		delete ItemAt(index);
 
 	return _PointerList_::ReplaceItem(index, (void*)item);
@@ -614,7 +633,7 @@ template<class T, bool Owning>
 void
 BObjectList<T, Owning>::MakeEmpty(bool deleteIfOwning)
 {
-	if (Owning && deleteIfOwning) {
+	if (_IsOwning() && deleteIfOwning) {
 		int32 count = CountItems();
 		for (int32 index = 0; index < count; index++)
 			delete ItemAt(index);
